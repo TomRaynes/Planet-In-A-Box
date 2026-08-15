@@ -11,7 +11,10 @@ import java.util.concurrent.CopyOnWriteArrayList;
 /**
  * PlanetBoxSimulation
  *
- * A 2D Newtonian gravity simulation of planets confined to an inescapable box.
+ * A 2D Newtonian gravity simulation of planets confined to an inescapable square
+ * box. The box starts empty: press on the canvas where a body should appear, drag
+ * towards the direction it should travel, and release to launch it. Its mass,
+ * radius and launch speed come from the spawn sliders.
  * Planets attract each other via Newton's law of universal gravitation
  * (F = G * m1 * m2 / r^2) and bounce elastically (or inelastically, depending
  * on the restitution setting) off the walls of the box, like pool balls off a
@@ -27,7 +30,7 @@ import java.util.concurrent.CopyOnWriteArrayList;
  *   - Zero-radius mode: bodies have no contact cross-section, so they pass straight
  *     through one another; they are still drawn full size and still hit the walls
  *   - Gravity softening (prevents singular forces at tiny separations)
- *   - Number of planets, mass range and radius range used on reset
+ *   - Mass, radius and launch speed given to the next body the user drags out
  *   - Trails on/off and trail length
  *   - "Show gravitational well": swaps the top-down view for a 3D one, where the
  *     (x,y) plane is drawn as a tilted rubber sheet whose z displacement is the
@@ -82,17 +85,16 @@ public class PlanetBoxSimulation {
         volatile boolean paused = false;
 
         // Gravitational well (3D space-time sheet) view:
-        volatile boolean showGravityWell = false;
+        volatile boolean showGravityWell = true;
         volatile double wellDepthScale = 3.5;   // px of dip per unit of potential
         volatile double wellPitch = 58;         // camera tilt, degrees (0 = top-down)
         volatile double wellYaw = 22;           // camera rotation about the vertical, degrees
-        volatile int wellResolution = 64;       // mesh columns across the box
+        volatile int wellResolution = 64;       // mesh cells across the box
 
-        // Used when (re)spawning planets:
-        volatile int planetCount = 8;
-        volatile double minMass = 50, maxMass = 800;
-        volatile double minRadius = 6, maxRadius = 18;
-        volatile double maxInitialSpeed = 60;
+        // Properties given to the next body the user launches:
+        volatile double spawnMass = 400;
+        volatile double spawnRadius = 12;
+        volatile double spawnSpeed = 60;
     }
 
     // ------------------------------------------------------------------
@@ -126,26 +128,42 @@ public class PlanetBoxSimulation {
         private final Random rng = new Random();
         private javax.swing.Timer timer;
 
+        // Drag-to-launch state, in simulation-plane coordinates.
+        private boolean dragging;
+        private double dragFromX, dragFromY, dragToX, dragToY;
+
         SimulationPanel(SimulationConfig cfg) {
             this.cfg = cfg;
-            setPreferredSize(new Dimension(900, 700));
+            setPreferredSize(new Dimension(820, 820));
             setBackground(new Color(8, 10, 24));
-            respawnPlanets();
 
-            // Click to add a planet at the cursor with a random velocity.
-            addMouseListener(new MouseAdapter() {
+            // Press where the body should appear, drag towards where it should head,
+            // release to launch it. The box starts empty; every body comes from here.
+            MouseAdapter launcher = new MouseAdapter() {
                 @Override public void mousePressed(MouseEvent e) {
-                    double x = e.getX(), y = e.getY();
-                    if (cfg.showGravityWell) {
-                        // Map the click back onto the (x,y) plane through the 3D camera.
-                        double[] world = new WellView(getWidth(), getHeight()).unproject(x, y);
-                        x = world[0]; y = world[1];
-                    }
-                    x = Math.max(0, Math.min(getWidth(), x));
-                    y = Math.max(0, Math.min(getHeight(), y));
-                    planets.add(randomPlanet(x, y));
+                    double[] w = toPlane(e.getX(), e.getY());
+                    dragFromX = w[0]; dragFromY = w[1];
+                    dragToX = w[0];   dragToY = w[1];
+                    dragging = true;
+                    repaint();
                 }
-            });
+                @Override public void mouseDragged(MouseEvent e) {
+                    if (!dragging) return;
+                    double[] w = toPlane(e.getX(), e.getY());
+                    dragToX = w[0]; dragToY = w[1];
+                    repaint();
+                }
+                @Override public void mouseReleased(MouseEvent e) {
+                    if (!dragging) return;
+                    double[] w = toPlane(e.getX(), e.getY());
+                    dragToX = w[0]; dragToY = w[1];
+                    dragging = false;
+                    planets.add(newBody(dragFromX, dragFromY, dragToX - dragFromX, dragToY - dragFromY));
+                    repaint();
+                }
+            };
+            addMouseListener(launcher);
+            addMouseMotionListener(launcher);
         }
 
         void start() {
@@ -158,34 +176,60 @@ public class PlanetBoxSimulation {
             timer.start();
         }
 
-        void respawnPlanets() {
+        void clearPlanets() {
             planets.clear();
-            int w = Math.max(getWidth(), 900), h = Math.max(getHeight(), 700);
-            for (int i = 0; i < cfg.planetCount; i++) {
-                double r = cfg.minRadius + rng.nextDouble() * (cfg.maxRadius - cfg.minRadius);
-                double x = r + rng.nextDouble() * (w - 2 * r);
-                double y = r + rng.nextDouble() * (h - 2 * r);
-                planets.add(randomPlanet(x, y));
-            }
         }
 
         void clearTrails() {
             for (Planet p : planets) p.trail.clear();
         }
 
-        private Planet randomPlanet(double x, double y) {
-            double mass = cfg.minMass + rng.nextDouble() * (cfg.maxMass - cfg.minMass);
-            double radius = cfg.minRadius + rng.nextDouble() * (cfg.maxRadius - cfg.minRadius);
-            double angle = rng.nextDouble() * Math.PI * 2;
-            double speed = rng.nextDouble() * cfg.maxInitialSpeed;
+        // ----------------- The square simulation plane -----------------
+        //
+        // The world is a box x box square centred in the panel, so the sheet in the
+        // 3D view is square whatever shape the window happens to be.
+
+        int boxSize()    { return Math.min(getWidth(), getHeight()); }
+        int boxOriginX() { return (getWidth() - boxSize()) / 2; }
+        int boxOriginY() { return (getHeight() - boxSize()) / 2; }
+
+        /** Screen point -> simulation-plane coordinates, through the current view. */
+        private double[] toPlane(double screenX, double screenY) {
+            if (cfg.showGravityWell) return new WellView().unproject(screenX, screenY);
+            return new double[]{screenX - boxOriginX(), screenY - boxOriginY()};
+        }
+
+        /**
+         * A body launched from (x,y) heading along (dirX, dirY). The drag only sets
+         * the direction — mass, radius and speed all come from the spawn sliders — so
+         * a drag of any length gives the same launch speed.
+         */
+        private Planet newBody(double x, double y, double dirX, double dirY) {
+            double r = cfg.spawnRadius, box = boxSize();
+            x = Math.max(r, Math.min(box - r, x));
+            y = Math.max(r, Math.min(box - r, y));
+            double len = Math.hypot(dirX, dirY);
+            double vx = 0, vy = 0;
+            if (len > 1e-6) {
+                vx = dirX / len * cfg.spawnSpeed;
+                vy = dirY / len * cfg.spawnSpeed;
+            }
             Color color = Color.getHSBColor(rng.nextFloat(), 0.65f + rng.nextFloat() * 0.35f, 0.95f);
-            return new Planet(x, y, Math.cos(angle) * speed, Math.sin(angle) * speed, mass, radius, color);
+            return new Planet(x, y, vx, vy, cfg.spawnMass, r, color);
+        }
+
+        /** Velocity the in-progress drag would launch with (zero if it has no length). */
+        private double[] dragVelocity() {
+            double dx = dragToX - dragFromX, dy = dragToY - dragFromY;
+            double len = Math.hypot(dx, dy);
+            if (len <= 1e-6) return new double[]{0, 0};
+            return new double[]{dx / len * cfg.spawnSpeed, dy / len * cfg.spawnSpeed};
         }
 
         // ----------------- Physics -----------------
         private void step(double dt) {
-            int w = getWidth(), h = getHeight();
-            if (w <= 0 || h <= 0) return;
+            int box = boxSize();
+            if (box <= 0) return;
 
             // 1) Pairwise Newtonian gravity with Plummer softening.
             for (Planet p : planets) { p.ax = 0; p.ay = 0; }
@@ -232,10 +276,10 @@ public class PlanetBoxSimulation {
             for (Planet p : list) {
                 double r = p.radius;
                 boolean bounced = false;
-                if (p.x - r < 0)      { p.x = r;       p.vx = Math.abs(p.vx);  bounced = true; }
-                else if (p.x + r > w) { p.x = w - r;   p.vx = -Math.abs(p.vx); bounced = true; }
-                if (p.y - r < 0)      { p.y = r;       p.vy = Math.abs(p.vy);  bounced = true; }
-                else if (p.y + r > h) { p.y = h - r;   p.vy = -Math.abs(p.vy); bounced = true; }
+                if (p.x - r < 0)        { p.x = r;         p.vx = Math.abs(p.vx);  bounced = true; }
+                else if (p.x + r > box) { p.x = box - r;   p.vx = -Math.abs(p.vx); bounced = true; }
+                if (p.y - r < 0)        { p.y = r;         p.vy = Math.abs(p.vy);  bounced = true; }
+                else if (p.y + r > box) { p.y = box - r;   p.vy = -Math.abs(p.vy); bounced = true; }
                 if (bounced) {
                     p.vx *= cfg.wallRestitution;
                     p.vy *= cfg.wallRestitution;
@@ -290,22 +334,23 @@ public class PlanetBoxSimulation {
             if (cfg.showGravityWell) {
                 paintGravityWell(g2);
             } else {
-                paintFlat(g2);
+                // Work in plane coordinates: the square box is centred in the panel.
+                Graphics2D gt = (Graphics2D) g2.create();
+                gt.translate(boxOriginX(), boxOriginY());
+                paintFlat(gt);
+                gt.dispose();
             }
 
-            // Box edge + HUD
-            g2.setColor(new Color(90, 110, 200));
-            g2.setStroke(new BasicStroke(3));
-            g2.drawRect(1, 1, getWidth() - 3, getHeight() - 3);
-            g2.setStroke(new BasicStroke(1));
             g2.setColor(new Color(200, 210, 255, 180));
-            g2.drawString(String.format("Planets: %d   %s   (click to add a planet)%s",
+            g2.drawString(String.format("Bodies: %d   %s   (drag to launch a body)%s",
                     planets.size(), cfg.paused ? "PAUSED" : "running",
                     cfg.showGravityWell ? "   [gravitational well]" : ""), 12, 20);
         }
 
-        /** The original top-down 2D view. */
+        /** The top-down 2D view, drawn in plane coordinates. */
         private void paintFlat(Graphics2D g2) {
+            int box = boxSize();
+
             // Trails
             if (cfg.showTrails) {
                 for (Planet p : planets) {
@@ -344,6 +389,39 @@ public class PlanetBoxSimulation {
                 }
             }
 
+            // Launch preview: ghost body, a faint guide out to the cursor, and the
+            // arrow showing the velocity it will actually be launched with.
+            if (dragging) {
+                double[] v = dragVelocity();
+                double r = cfg.spawnRadius;
+                g2.setColor(new Color(255, 255, 255, 120));
+                g2.drawLine((int) dragFromX, (int) dragFromY, (int) dragToX, (int) dragToY);
+                g2.setColor(new Color(255, 255, 255, 70));
+                g2.fillOval((int) (dragFromX - r), (int) (dragFromY - r), (int) (r * 2), (int) (r * 2));
+                g2.setColor(new Color(255, 255, 255, 200));
+                g2.drawOval((int) (dragFromX - r), (int) (dragFromY - r), (int) (r * 2), (int) (r * 2));
+                drawArrow(g2, dragFromX, dragFromY, dragFromX + v[0] * 0.3, dragFromY + v[1] * 0.3);
+            }
+
+            // Walls of the box
+            g2.setColor(new Color(90, 110, 200));
+            g2.setStroke(new BasicStroke(3));
+            g2.drawRect(1, 1, box - 3, box - 3);
+            g2.setStroke(new BasicStroke(1));
+        }
+
+        /** A line with a small arrowhead, used for the launch preview. */
+        private void drawArrow(Graphics2D g2, double x0, double y0, double x1, double y1) {
+            g2.setColor(new Color(255, 255, 255, 200));
+            g2.drawLine((int) x0, (int) y0, (int) x1, (int) y1);
+            double dx = x1 - x0, dy = y1 - y0;
+            double len = Math.hypot(dx, dy);
+            if (len < 6) return;
+            double ux = dx / len, uy = dy / len, head = Math.min(12, len * 0.35);
+            g2.drawLine((int) x1, (int) y1,
+                    (int) (x1 - head * (ux * 0.87 - uy * 0.5)), (int) (y1 - head * (uy * 0.87 + ux * 0.5)));
+            g2.drawLine((int) x1, (int) y1,
+                    (int) (x1 - head * (ux * 0.87 + uy * 0.5)), (int) (y1 - head * (uy * 0.87 - ux * 0.5)));
         }
 
         // ----------------- Gravitational well (3D) -----------------
@@ -356,12 +434,12 @@ public class PlanetBoxSimulation {
         // then drawn as shaded quads through an oblique camera (tilt + rotation),
         // with each planet drawn as a lit sphere sitting in the sheet above its dip.
 
-        private double[][] wellZ;                 // sheet height, [cols+1][rows+1]
-        private int wellCols, wellRows;
-        private double wellCellW, wellCellH;
+        private double[][] wellZ;   // sheet height, [n+1][n+1] — the plane is square
+        private int wellN;          // mesh cells per side
+        private double wellCell;    // world units per cell
 
         /** Maximum dip, in world units, that the sheet is allowed to reach. */
-        private double maxWellDepth(int h) { return h * 0.45; }
+        private double maxWellDepth() { return boxSize() * 0.45; }
 
         /**
          * Squared softening length used when sampling a body's potential. Widened
@@ -369,35 +447,33 @@ public class PlanetBoxSimulation {
          * funnel spans several cells and reads as a bowl rather than a one-cell spike.
          */
         private double wellSoftening(Planet p) {
-            double soft = Math.max(Math.max(p.radius * 2.0, cfg.softening), wellCellW * 0.8);
+            double soft = Math.max(Math.max(p.radius * 2.0, cfg.softening), wellCell * 0.8);
             return soft * soft;
         }
 
         /** Samples the gravitational potential onto the mesh grid. */
-        private void computeWellGrid(int w, int h) {
-            int cols = Math.max(8, cfg.wellResolution);
-            int rows = Math.max(6, (int) Math.round(cols * (double) h / w));
-            if (wellZ == null || wellCols != cols || wellRows != rows) {
-                wellCols = cols; wellRows = rows;
-                wellZ = new double[cols + 1][rows + 1];
+        private void computeWellGrid(int box) {
+            int n = Math.max(8, cfg.wellResolution);
+            if (wellZ == null || wellN != n) {
+                wellN = n;
+                wellZ = new double[n + 1][n + 1];
             }
-            wellCellW = (double) w / cols;
-            wellCellH = (double) h / rows;
+            wellCell = (double) box / n;
 
-            double maxZ = maxWellDepth(h);
+            double maxZ = maxWellDepth();
             double k = cfg.wellDepthScale;
             Planet[] ps = planets.toArray(new Planet[0]);
             double[] eps2 = new double[ps.length];
-            for (int n = 0; n < ps.length; n++) eps2[n] = wellSoftening(ps[n]);
+            for (int m = 0; m < ps.length; m++) eps2[m] = wellSoftening(ps[m]);
 
-            for (int i = 0; i <= cols; i++) {
-                double gx = i * wellCellW;
-                for (int j = 0; j <= rows; j++) {
-                    double gy = j * wellCellH;
+            for (int i = 0; i <= n; i++) {
+                double gx = i * wellCell;
+                for (int j = 0; j <= n; j++) {
+                    double gy = j * wellCell;
                     double potential = 0;
-                    for (int n = 0; n < ps.length; n++) {
-                        double dx = gx - ps[n].x, dy = gy - ps[n].y;
-                        potential += ps[n].mass / Math.sqrt(dx * dx + dy * dy + eps2[n]);
+                    for (int m = 0; m < ps.length; m++) {
+                        double dx = gx - ps[m].x, dy = gy - ps[m].y;
+                        potential += ps[m].mass / Math.sqrt(dx * dx + dy * dy + eps2[m]);
                     }
                     wellZ[i][j] = depthOf(potential, maxZ, k);
                 }
@@ -419,23 +495,23 @@ public class PlanetBoxSimulation {
          * bottom of its own funnel) keeps the body visible above the dip it creates,
          * which is also how the rubber-sheet analogy is normally drawn.
          */
-        private double restingZ(Planet self, int h) {
+        private double restingZ(Planet self) {
             double potential = 0;
             for (Planet p : planets) {
                 if (p == self) continue;
                 double dx = self.x - p.x, dy = self.y - p.y;
                 potential += p.mass / Math.sqrt(dx * dx + dy * dy + wellSoftening(p));
             }
-            return depthOf(potential, maxWellDepth(h), cfg.wellDepthScale);
+            return depthOf(potential, maxWellDepth(), cfg.wellDepthScale);
         }
 
         /** Bilinear lookup of the sheet height at an arbitrary point. */
         private double sampleWell(double x, double y) {
             if (wellZ == null) return 0;
-            double fx = Math.max(0, Math.min(wellCols, x / wellCellW));
-            double fy = Math.max(0, Math.min(wellRows, y / wellCellH));
-            int i = Math.min((int) fx, wellCols - 1);
-            int j = Math.min((int) fy, wellRows - 1);
+            double fx = Math.max(0, Math.min(wellN, x / wellCell));
+            double fy = Math.max(0, Math.min(wellN, y / wellCell));
+            int i = Math.min((int) fx, wellN - 1);
+            int j = Math.min((int) fy, wellN - 1);
             double tx = fx - i, ty = fy - j;
             double top = wellZ[i][j] * (1 - tx) + wellZ[i + 1][j] * tx;
             double bot = wellZ[i][j + 1] * (1 - tx) + wellZ[i + 1][j + 1] * tx;
@@ -443,19 +519,19 @@ public class PlanetBoxSimulation {
         }
 
         private void paintGravityWell(Graphics2D g2) {
-            int w = getWidth(), h = getHeight();
-            if (w <= 0 || h <= 0) return;
+            int box = boxSize();
+            if (box <= 0) return;
 
-            computeWellGrid(w, h);
-            WellView v = new WellView(w, h);
-            double maxZ = maxWellDepth(h);
+            computeWellGrid(box);
+            WellView v = new WellView();
+            double maxZ = maxWellDepth();
 
             // Bucket the planets by mesh row so they can be drawn interleaved with
             // the sheet — that gives correct occlusion without a depth buffer.
-            List<List<Planet>> byRow = new ArrayList<>(wellRows);
-            for (int j = 0; j < wellRows; j++) byRow.add(null);
+            List<List<Planet>> byRow = new ArrayList<>(wellN);
+            for (int j = 0; j < wellN; j++) byRow.add(null);
             for (Planet p : planets) {
-                int j = Math.max(0, Math.min(wellRows - 1, (int) (p.y / wellCellH)));
+                int j = Math.max(0, Math.min(wellN - 1, (int) (p.y / wellCell)));
                 if (byRow.get(j) == null) byRow.set(j, new ArrayList<>(2));
                 byRow.get(j).add(p);
             }
@@ -465,11 +541,11 @@ public class PlanetBoxSimulation {
             boolean colsAscending = v.sinY >= 0;
             int[] xs = new int[4], ys = new int[4];
 
-            for (int j = 0; j < wellRows; j++) {
-                double y0 = j * wellCellH, y1 = (j + 1) * wellCellH;
-                for (int c = 0; c < wellCols; c++) {
-                    int i = colsAscending ? c : wellCols - 1 - c;
-                    double x0 = i * wellCellW, x1 = (i + 1) * wellCellW;
+            for (int j = 0; j < wellN; j++) {
+                double y0 = j * wellCell, y1 = (j + 1) * wellCell;
+                for (int c = 0; c < wellN; c++) {
+                    int i = colsAscending ? c : wellN - 1 - c;
+                    double x0 = i * wellCell, x1 = (i + 1) * wellCell;
                     double z00 = wellZ[i][j], z10 = wellZ[i + 1][j];
                     double z01 = wellZ[i][j + 1], z11 = wellZ[i + 1][j + 1];
 
@@ -481,8 +557,8 @@ public class PlanetBoxSimulation {
                     double avgZ = (z00 + z10 + z01 + z11) * 0.25;
                     double depth = Math.min(1, -avgZ / maxZ);
                     // Diffuse shading from the sheet's own slope.
-                    double dzdx = ((z10 + z11) - (z00 + z01)) * 0.5 / wellCellW;
-                    double dzdy = ((z01 + z11) - (z00 + z10)) * 0.5 / wellCellH;
+                    double dzdx = ((z10 + z11) - (z00 + z01)) * 0.5 / wellCell;
+                    double dzdy = ((z01 + z11) - (z00 + z10)) * 0.5 / wellCell;
                     double len = Math.sqrt(dzdx * dzdx + dzdy * dzdy + 1);
                     double lambert = (0.45 * dzdx + 0.62 * dzdy + 0.65) / len;
                     double shade = 0.35 + 0.75 * Math.max(0, lambert);
@@ -510,19 +586,36 @@ public class PlanetBoxSimulation {
             g2.setColor(new Color(120, 145, 235, 200));
             g2.setStroke(new BasicStroke(2f));
             drawWellEdge(g2, v, 0, 0, 1, 0);
-            drawWellEdge(g2, v, 0, wellRows, 1, 0);
+            drawWellEdge(g2, v, 0, wellN, 1, 0);
             drawWellEdge(g2, v, 0, 0, 0, 1);
-            drawWellEdge(g2, v, wellCols, 0, 0, 1);
+            drawWellEdge(g2, v, wellN, 0, 0, 1);
             g2.setStroke(new BasicStroke(1f));
+
+            // Launch preview: a ghost body sitting on the sheet, plus its heading.
+            if (dragging) {
+                double r = cfg.spawnRadius;
+                double z = sampleWell(dragFromX, dragFromY) + r;
+                double cx = v.sx(dragFromX, dragFromY), cy = v.sy(dragFromX, dragFromY, z);
+                double rr = r * v.scale;
+                g2.setColor(new Color(255, 255, 255, 120));
+                g2.drawLine((int) cx, (int) cy, (int) v.sx(dragToX, dragToY),
+                        (int) v.sy(dragToX, dragToY, sampleWell(dragToX, dragToY)));
+                g2.setColor(new Color(255, 255, 255, 70));
+                g2.fillOval((int) (cx - rr), (int) (cy - rr), (int) (rr * 2), (int) (rr * 2));
+                g2.setColor(new Color(255, 255, 255, 200));
+                g2.drawOval((int) (cx - rr), (int) (cy - rr), (int) (rr * 2), (int) (rr * 2));
+                double[] vel = dragVelocity();
+                double tx = dragFromX + vel[0] * 0.3, ty = dragFromY + vel[1] * 0.3;
+                drawArrow(g2, cx, cy, v.sx(tx, ty), v.sy(tx, ty, z));
+            }
         }
 
         /** Traces one edge of the mesh, following the sheet's height. */
         private void drawWellEdge(Graphics2D g2, WellView v, int i0, int j0, int di, int dj) {
-            int steps = di != 0 ? wellCols : wellRows;
             int px = 0, py = 0;
-            for (int s = 0; s <= steps; s++) {
+            for (int s = 0; s <= wellN; s++) {
                 int i = i0 + di * s, j = j0 + dj * s;
-                double x = i * wellCellW, y = j * wellCellH;
+                double x = i * wellCell, y = j * wellCell;
                 int sx = (int) v.sx(x, y), sy = (int) v.sy(x, y, wellZ[i][j]);
                 if (s > 0) g2.drawLine(px, py, sx, sy);
                 px = sx; py = sy;
@@ -547,7 +640,7 @@ public class PlanetBoxSimulation {
         /** A planet as a lit sphere sitting at the bottom of its own well. */
         private void drawPlanet3D(Graphics2D g2, WellView v, Planet p) {
             double radius = p.radius;
-            double z = restingZ(p, v.h) + radius;
+            double z = restingZ(p) + radius;
             double cx = v.sx(p.x, p.y);
             double cy = v.sy(p.x, p.y, z);
             double r = radius * v.scale;
@@ -599,40 +692,49 @@ public class PlanetBoxSimulation {
          * viewer. pitch = 0 is straight down (no z visible), pitch -> 90 is edge-on.
          */
         final class WellView {
-            final int w, h;
+            final double box, half;
             final double cosP, sinP, cosY, sinY, scale, cx, cy;
 
-            WellView(int w, int h) {
-                this.w = w; this.h = h;
+            WellView() {
+                box = boxSize();
+                half = box / 2.0;
                 double pitch = Math.toRadians(cfg.wellPitch);
                 double yaw = Math.toRadians(cfg.wellYaw);
                 cosP = Math.cos(pitch); sinP = Math.sin(pitch);
                 cosY = Math.cos(yaw);   sinY = Math.sin(yaw);
-                // Shrink so the rotated footprint still fits across the canvas.
-                double footprint = Math.abs(w * cosY) + Math.abs(h * sinY);
-                scale = 0.92 * w / footprint;
-                cx = w / 2.0;
-                cy = h * 0.38;   // plane sits high; the wells hang below it
+
+                // A square rotated by `yaw` spans this much in each direction, and the
+                // drawing reaches a well's depth below the plane. Scale to whichever of
+                // the two axes is tighter, then centre the whole figure in the panel.
+                // Wells approach maxWellDepth only asymptotically, so reserving the
+                // full depth would leave the sheet stranded at the top of the panel;
+                // budget for a deep-but-realistic well instead.
+                int pw = getWidth(), ph = getHeight();
+                double footprint = box * (Math.abs(cosY) + Math.abs(sinY));
+                double tall = footprint * cosP + maxWellDepth() * 0.6 * sinP;
+                scale = Math.min(0.94 * pw / footprint, 0.94 * ph / tall);
+                cx = pw / 2.0;
+                cy = (ph - tall * scale) / 2.0 + footprint * cosP * scale / 2.0;
             }
 
             /** Screen x of a plane point. */
             double sx(double x, double y) {
-                return cx + ((x - w / 2.0) * cosY - (y - h / 2.0) * sinY) * scale;
+                return cx + ((x - half) * cosY - (y - half) * sinY) * scale;
             }
 
             /** Screen y of a plane point lifted to height z. */
             double sy(double x, double y, double z) {
-                double depth = (x - w / 2.0) * sinY + (y - h / 2.0) * cosY;
+                double depth = (x - half) * sinY + (y - half) * cosY;
                 return cy + (depth * cosP - z * sinP) * scale;
             }
 
-            /** Screen point back onto the z = 0 plane (used for click-to-add). */
+            /** Screen point back onto the z = 0 plane (used for drag-to-launch). */
             double[] unproject(double screenX, double screenY) {
                 double xr = (screenX - cx) / scale;
                 double yr = (screenY - cy) / (scale * Math.max(1e-6, cosP));
                 return new double[]{
-                        xr * cosY + yr * sinY + w / 2.0,
-                        -xr * sinY + yr * cosY + h / 2.0};
+                        xr * cosY + yr * sinY + half,
+                        -xr * sinY + yr * cosY + half};
             }
         }
     }
@@ -689,19 +791,13 @@ public class PlanetBoxSimulation {
             add(collisions);
 
             // --- Spawn settings group ---
-            JPanel spawn = group("Spawn Settings (applied on Reset)");
-            spawn.add(slider("Planet count", 1, 40, cfg.planetCount,
-                    v -> cfg.planetCount = (int) v, "%.0f", 1));
-            spawn.add(slider("Min mass", 10, 2000, (int) cfg.minMass,
-                    v -> cfg.minMass = Math.min(v, cfg.maxMass), "%.0f", 1));
-            spawn.add(slider("Max mass", 10, 5000, (int) cfg.maxMass,
-                    v -> cfg.maxMass = Math.max(v, cfg.minMass), "%.0f", 1));
-            spawn.add(slider("Min radius", 2, 30, (int) cfg.minRadius,
-                    v -> cfg.minRadius = Math.min(v, cfg.maxRadius), "%.0f", 1));
-            spawn.add(slider("Max radius", 2, 50, (int) cfg.maxRadius,
-                    v -> cfg.maxRadius = Math.max(v, cfg.minRadius), "%.0f", 1));
-            spawn.add(slider("Max initial speed", 0, 300, (int) cfg.maxInitialSpeed,
-                    v -> cfg.maxInitialSpeed = v, "%.0f", 1));
+            JPanel spawn = group("Next Body (drag on the canvas)");
+            spawn.add(slider("Mass", 10, 5000, (int) cfg.spawnMass,
+                    v -> cfg.spawnMass = v, "%.0f", 1));
+            spawn.add(slider("Radius", 2, 50, (int) cfg.spawnRadius,
+                    v -> cfg.spawnRadius = v, "%.0f", 1));
+            spawn.add(slider("Launch speed", 0, 300, (int) cfg.spawnSpeed,
+                    v -> cfg.spawnSpeed = v, "%.0f", 1));
             add(spawn);
 
             // --- Display group ---
@@ -754,9 +850,9 @@ public class PlanetBoxSimulation {
             });
             buttons.add(pauseBtn);
 
-            JButton resetBtn = new JButton("Reset (respawn planets)");
-            resetBtn.addActionListener(e -> sim.respawnPlanets());
-            buttons.add(resetBtn);
+            JButton clearBtn = new JButton("Clear all bodies");
+            clearBtn.addActionListener(e -> sim.clearPlanets());
+            buttons.add(clearBtn);
 
             JButton clearTrailsBtn = new JButton("Clear trails");
             clearTrailsBtn.addActionListener(e -> sim.clearTrails());
