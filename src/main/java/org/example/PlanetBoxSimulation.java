@@ -21,9 +21,11 @@ import java.util.concurrent.CopyOnWriteArrayList;
  *   - Gravitational constant G
  *   - Time step (dt)
  *   - Simulation speed (steps per frame)
- *   - Wall restitution (bounciness, 1.0 = perfectly elastic)
+ *   - Wall restitution: the fraction of a body's speed that survives each bounce
+ *     off a cushion (1.0 = perfectly elastic, nothing lost)
  *   - Planet-planet collisions on/off, with their own restitution
- *   - Point-mass mode: every body shrinks to radius 0, so nothing can ever collide
+ *   - Zero-radius mode: bodies have no contact cross-section, so they pass straight
+ *     through one another; they are still drawn full size and still hit the walls
  *   - Gravity softening (prevents singular forces at tiny separations)
  *   - Number of planets, mass range and radius range used on reset
  *   - Trails on/off and trail length
@@ -69,10 +71,10 @@ public class PlanetBoxSimulation {
         volatile double gravitationalConstant = 2000.0; // scaled G for pixel units
         volatile double timeStep = 0.005;               // dt per physics step
         volatile int stepsPerFrame = 4;                 // physics steps per rendered frame
-        volatile double wallRestitution = 1.0;          // 1 = elastic cushion
+        volatile double wallRestitution = 0.9;          // speed kept per wall bounce (1 = elastic)
         volatile double planetRestitution = 0.9;        // for planet-planet impacts
         volatile boolean planetCollisions = true;
-        volatile boolean pointMasses = false;           // radius 0: bodies can never collide
+        volatile boolean pointMasses = false;           // zero contact radius: bodies never collide
         volatile double softening = 4.0;                // gravity softening length (px)
         volatile boolean showTrails = true;
         volatile int trailLength = 200;
@@ -180,17 +182,6 @@ public class PlanetBoxSimulation {
             return new Planet(x, y, Math.cos(angle) * speed, Math.sin(angle) * speed, mass, radius, color);
         }
 
-        /**
-         * Radius the physics sees. In point-mass mode every body collapses to a
-         * dimensionless point, so no two bodies can ever overlap and they reach the
-         * walls before turning around. Their `radius` field is left untouched, so
-         * switching back restores the original sizes.
-         */
-        private double effRadius(Planet p) { return cfg.pointMasses ? 0 : p.radius; }
-
-        /** Radius used for drawing — a point mass still gets a small visible dot. */
-        private double drawRadius(Planet p) { return cfg.pointMasses ? 2.5 : p.radius; }
-
         // ----------------- Physics -----------------
         private void step(double dt) {
             int w = getWidth(), h = getHeight();
@@ -235,13 +226,20 @@ public class PlanetBoxSimulation {
                 }
             }
 
-            // 4) Inescapable box: reflect off the cushions.
+            // 4) Inescapable box: reflect off the cushions. Restitution scales the
+            //    whole velocity rather than just the reflected component, so every
+            //    bounce costs speed — even a glancing one along the cushion.
             for (Planet p : list) {
-                double r = effRadius(p);
-                if (p.x - r < 0)      { p.x = r;       p.vx = Math.abs(p.vx) * cfg.wallRestitution; }
-                else if (p.x + r > w) { p.x = w - r;   p.vx = -Math.abs(p.vx) * cfg.wallRestitution; }
-                if (p.y - r < 0)      { p.y = r;       p.vy = Math.abs(p.vy) * cfg.wallRestitution; }
-                else if (p.y + r > h) { p.y = h - r;   p.vy = -Math.abs(p.vy) * cfg.wallRestitution; }
+                double r = p.radius;
+                boolean bounced = false;
+                if (p.x - r < 0)      { p.x = r;       p.vx = Math.abs(p.vx);  bounced = true; }
+                else if (p.x + r > w) { p.x = w - r;   p.vx = -Math.abs(p.vx); bounced = true; }
+                if (p.y - r < 0)      { p.y = r;       p.vy = Math.abs(p.vy);  bounced = true; }
+                else if (p.y + r > h) { p.y = h - r;   p.vy = -Math.abs(p.vy); bounced = true; }
+                if (bounced) {
+                    p.vx *= cfg.wallRestitution;
+                    p.vy *= cfg.wallRestitution;
+                }
             }
 
             // 5) Trails.
@@ -327,7 +325,7 @@ public class PlanetBoxSimulation {
 
             // Planets
             for (Planet p : planets) {
-                double radius = drawRadius(p);
+                double radius = p.radius;
                 int d = (int) (radius * 2);
                 // soft glow
                 g2.setColor(new Color(p.color.getRed(), p.color.getGreen(), p.color.getBlue(), 40));
@@ -368,11 +366,10 @@ public class PlanetBoxSimulation {
         /**
          * Squared softening length used when sampling a body's potential. Widened
          * beyond the body's own radius, and floored at roughly one mesh cell, so each
-         * funnel spans several cells and reads as a bowl rather than a one-cell spike
-         * — including in point-mass mode, where the radius is zero.
+         * funnel spans several cells and reads as a bowl rather than a one-cell spike.
          */
         private double wellSoftening(Planet p) {
-            double soft = Math.max(Math.max(effRadius(p) * 2.0, cfg.softening), wellCellW * 0.8);
+            double soft = Math.max(Math.max(p.radius * 2.0, cfg.softening), wellCellW * 0.8);
             return soft * soft;
         }
 
@@ -549,7 +546,7 @@ public class PlanetBoxSimulation {
 
         /** A planet as a lit sphere sitting at the bottom of its own well. */
         private void drawPlanet3D(Graphics2D g2, WellView v, Planet p) {
-            double radius = drawRadius(p);
+            double radius = p.radius;
             double z = restingZ(p, v.h) + radius;
             double cx = v.sx(p.x, p.y);
             double cy = v.sy(p.x, p.y, z);
@@ -667,7 +664,7 @@ public class PlanetBoxSimulation {
 
             // --- Collisions group ---
             JPanel collisions = group("Collisions & Walls");
-            collisions.add(slider("Wall bounciness (%)", 0, 100, (int) (cfg.wallRestitution * 100),
+            collisions.add(slider("Wall bounciness (% speed kept)", 0, 100, (int) (cfg.wallRestitution * 100),
                     v -> cfg.wallRestitution = v / 100.0, "%.2f", 0.01));
 
             JCheckBox collideBox = new JCheckBox("Planet-planet collisions", cfg.planetCollisions);
@@ -675,9 +672,9 @@ public class PlanetBoxSimulation {
             collideBox.setAlignmentX(LEFT_ALIGNMENT);
             collideBox.setEnabled(!cfg.pointMasses);
 
-            JCheckBox pointBox = new JCheckBox("Point masses (radius 0)", cfg.pointMasses);
-            pointBox.setToolTipText("Shrink every body to a dimensionless point: they pass straight "
-                    + "through each other and can never collide");
+            JCheckBox pointBox = new JCheckBox("Zero radius (no collisions)", cfg.pointMasses);
+            pointBox.setToolTipText("Treat every body as a dimensionless point for contact: they pass "
+                    + "straight through each other. Still drawn full size, and still bounce off the walls.");
             pointBox.setAlignmentX(LEFT_ALIGNMENT);
             pointBox.addActionListener(e -> {
                 cfg.pointMasses = pointBox.isSelected();
