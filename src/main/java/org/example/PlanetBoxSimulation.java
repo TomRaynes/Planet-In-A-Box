@@ -95,6 +95,7 @@ public class PlanetBoxSimulation {
         volatile double spawnMass = 400;
         volatile double spawnRadius = 12;
         volatile double spawnSpeed = 60;
+        volatile boolean spawnFixed = false;    // pin the next body where it is placed
     }
 
     // ------------------------------------------------------------------
@@ -107,14 +108,25 @@ public class PlanetBoxSimulation {
         double mass;
         double radius;
         Color color;
+        /** Pinned in place: pulls on everything, is moved by nothing. */
+        final boolean fixed;
         final Deque<Point2D> trail = new ArrayDeque<>();
 
-        Planet(double x, double y, double vx, double vy, double mass, double radius, Color color) {
+        Planet(double x, double y, double vx, double vy, double mass, double radius,
+               Color color, boolean fixed) {
             this.x = x; this.y = y;
             this.vx = vx; this.vy = vy;
             this.mass = mass; this.radius = radius;
             this.color = color;
+            this.fixed = fixed;
         }
+
+        /**
+         * Inverse mass, as the collision solver sees it. A fixed body behaves as if
+         * infinitely massive, so impulses and overlap corrections leave it untouched
+         * and the body that hit it takes the whole of both.
+         */
+        double invMass() { return fixed ? 0 : 1.0 / mass; }
 
         record Point2D(double x, double y) {}
     }
@@ -202,28 +214,28 @@ public class PlanetBoxSimulation {
         /**
          * A body launched from (x,y) heading along (dirX, dirY). The drag only sets
          * the direction — mass, radius and speed all come from the spawn sliders — so
-         * a drag of any length gives the same launch speed.
+         * a drag of any length gives the same launch speed. A fixed body ignores the
+         * drag entirely and starts (and stays) at rest.
          */
         private Planet newBody(double x, double y, double dirX, double dirY) {
             double r = cfg.spawnRadius, box = boxSize();
             x = Math.max(r, Math.min(box - r, x));
             y = Math.max(r, Math.min(box - r, y));
-            double len = Math.hypot(dirX, dirY);
-            double vx = 0, vy = 0;
-            if (len > 1e-6) {
-                vx = dirX / len * cfg.spawnSpeed;
-                vy = dirY / len * cfg.spawnSpeed;
-            }
+            double[] v = launchVelocity(dirX, dirY);
             Color color = Color.getHSBColor(rng.nextFloat(), 0.65f + rng.nextFloat() * 0.35f, 0.95f);
-            return new Planet(x, y, vx, vy, cfg.spawnMass, r, color);
+            return new Planet(x, y, v[0], v[1], cfg.spawnMass, r, color, cfg.spawnFixed);
         }
 
-        /** Velocity the in-progress drag would launch with (zero if it has no length). */
+        /** Launch velocity for a drag of (dirX, dirY): direction from the drag, speed from the slider. */
+        private double[] launchVelocity(double dirX, double dirY) {
+            double len = Math.hypot(dirX, dirY);
+            if (cfg.spawnFixed || len <= 1e-6) return new double[]{0, 0};
+            return new double[]{dirX / len * cfg.spawnSpeed, dirY / len * cfg.spawnSpeed};
+        }
+
+        /** Velocity the in-progress drag would launch with. */
         private double[] dragVelocity() {
-            double dx = dragToX - dragFromX, dy = dragToY - dragFromY;
-            double len = Math.hypot(dx, dy);
-            if (len <= 1e-6) return new double[]{0, 0};
-            return new double[]{dx / len * cfg.spawnSpeed, dy / len * cfg.spawnSpeed};
+            return launchVelocity(dragToX - dragFromX, dragToY - dragFromY);
         }
 
         // ----------------- Physics -----------------
@@ -251,7 +263,10 @@ public class PlanetBoxSimulation {
             }
 
             // 2) Semi-implicit Euler: update velocity first, then position.
+            //    Fixed bodies are pinned: they still curve space for everyone else,
+            //    but nothing they feel is allowed to move them.
             for (Planet p : list) {
+                if (p.fixed) continue;
                 p.vx += p.ax * dt;
                 p.vy += p.ay * dt;
                 p.x += p.vx * dt;
@@ -274,6 +289,7 @@ public class PlanetBoxSimulation {
             //    whole velocity rather than just the reflected component, so every
             //    bounce costs speed — even a glancing one along the cushion.
             for (Planet p : list) {
+                if (p.fixed) continue;
                 double r = p.radius;
                 boolean bounced = false;
                 if (p.x - r < 0)        { p.x = r;         p.vx = Math.abs(p.vx);  bounced = true; }
@@ -289,6 +305,7 @@ public class PlanetBoxSimulation {
             // 5) Trails.
             if (cfg.showTrails) {
                 for (Planet p : list) {
+                    if (p.fixed) continue;   // a pinned body's trail is just a dot
                     p.trail.addLast(new Planet.Point2D(p.x, p.y));
                     while (p.trail.size() > cfg.trailLength) p.trail.removeFirst();
                 }
@@ -304,10 +321,12 @@ public class PlanetBoxSimulation {
 
             double nx = dx / dist, ny = dy / dist;
 
-            // Separate overlapping bodies proportionally to inverse mass.
+            // Separate overlapping bodies proportionally to inverse mass. Two fixed
+            // bodies have nothing to give, so leave them overlapping.
             double overlap = minDist - dist;
-            double invA = 1.0 / a.mass, invB = 1.0 / b.mass;
+            double invA = a.invMass(), invB = b.invMass();
             double invSum = invA + invB;
+            if (invSum == 0) return;
             a.x -= nx * overlap * (invA / invSum);
             a.y -= ny * overlap * (invA / invSum);
             b.x += nx * overlap * (invB / invSum);
@@ -380,6 +399,7 @@ public class PlanetBoxSimulation {
                 g2.fillOval((int) (p.x - radius), (int) (p.y - radius), d, d);
                 g2.setColor(p.color.brighter());
                 g2.drawOval((int) (p.x - radius), (int) (p.y - radius), d, d);
+                if (p.fixed) drawAnchor(g2, p.x, p.y, radius);
 
                 // velocity vector
                 if (cfg.showVectors) {
@@ -400,7 +420,8 @@ public class PlanetBoxSimulation {
                 g2.fillOval((int) (dragFromX - r), (int) (dragFromY - r), (int) (r * 2), (int) (r * 2));
                 g2.setColor(new Color(255, 255, 255, 200));
                 g2.drawOval((int) (dragFromX - r), (int) (dragFromY - r), (int) (r * 2), (int) (r * 2));
-                drawArrow(g2, dragFromX, dragFromY, dragFromX + v[0] * 0.3, dragFromY + v[1] * 0.3);
+                if (cfg.spawnFixed) drawAnchor(g2, dragFromX, dragFromY, r);
+                else drawArrow(g2, dragFromX, dragFromY, dragFromX + v[0] * 0.3, dragFromY + v[1] * 0.3);
             }
 
             // Walls of the box
@@ -408,6 +429,19 @@ public class PlanetBoxSimulation {
             g2.setStroke(new BasicStroke(3));
             g2.drawRect(1, 1, box - 3, box - 3);
             g2.setStroke(new BasicStroke(1));
+        }
+
+        /** Marks a pinned body: a ring with four ticks, like a surveyor's mark. */
+        private void drawAnchor(Graphics2D g2, double cx, double cy, double r) {
+            double ring = r + 5;
+            g2.setColor(new Color(235, 240, 255, 190));
+            g2.drawOval((int) (cx - ring), (int) (cy - ring), (int) (ring * 2), (int) (ring * 2));
+            for (int k = 0; k < 4; k++) {
+                double ang = Math.PI / 4 + k * Math.PI / 2;
+                double ux = Math.cos(ang), uy = Math.sin(ang);
+                g2.drawLine((int) (cx + ux * ring), (int) (cy + uy * ring),
+                        (int) (cx + ux * (ring + 4)), (int) (cy + uy * (ring + 4)));
+            }
         }
 
         /** A line with a small arrowhead, used for the launch preview. */
@@ -604,9 +638,13 @@ public class PlanetBoxSimulation {
                 g2.fillOval((int) (cx - rr), (int) (cy - rr), (int) (rr * 2), (int) (rr * 2));
                 g2.setColor(new Color(255, 255, 255, 200));
                 g2.drawOval((int) (cx - rr), (int) (cy - rr), (int) (rr * 2), (int) (rr * 2));
-                double[] vel = dragVelocity();
-                double tx = dragFromX + vel[0] * 0.3, ty = dragFromY + vel[1] * 0.3;
-                drawArrow(g2, cx, cy, v.sx(tx, ty), v.sy(tx, ty, z));
+                if (cfg.spawnFixed) {
+                    drawAnchor(g2, cx, cy, rr);
+                } else {
+                    double[] vel = dragVelocity();
+                    double tx = dragFromX + vel[0] * 0.3, ty = dragFromY + vel[1] * 0.3;
+                    drawArrow(g2, cx, cy, v.sx(tx, ty), v.sy(tx, ty, z));
+                }
             }
         }
 
@@ -673,6 +711,7 @@ public class PlanetBoxSimulation {
             g2.setPaint(null);
             g2.setColor(new Color(p.color.getRed(), p.color.getGreen(), p.color.getBlue(), 140));
             g2.drawOval((int) (cx - r), (int) (cy - r), (int) (r * 2), (int) (r * 2));
+            if (p.fixed) drawAnchor(g2, cx, cy, r);
 
             // Stalk dropping from the sphere to the floor of the well it digs.
             g2.setColor(new Color(255, 255, 255, 40));
@@ -798,6 +837,15 @@ public class PlanetBoxSimulation {
                     v -> cfg.spawnRadius = v, "%.0f", 1));
             spawn.add(slider("Launch speed", 0, 300, (int) cfg.spawnSpeed,
                     v -> cfg.spawnSpeed = v, "%.0f", 1));
+            JCheckBox fixedBox = new JCheckBox("Fix position", cfg.spawnFixed);
+            fixedBox.setToolTipText("Pin the body where it is placed: it pulls on everything "
+                    + "else but nothing can move it. Its launch direction is ignored.");
+            fixedBox.setAlignmentX(LEFT_ALIGNMENT);
+            fixedBox.addActionListener(e -> {
+                cfg.spawnFixed = fixedBox.isSelected();
+                sim.repaint();
+            });
+            spawn.add(fixedBox);
             add(spawn);
 
             // --- Display group ---
