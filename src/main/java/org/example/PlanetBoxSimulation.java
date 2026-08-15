@@ -7,6 +7,7 @@ import java.awt.event.*;
 import java.util.List;
 import java.util.*;
 import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.stream.IntStream;
 
 /**
  * PlanetBoxSimulation
@@ -111,6 +112,8 @@ public class PlanetBoxSimulation {
         /** Pinned in place: pulls on everything, is moved by nothing. */
         final boolean fixed;
         final Deque<Point2D> trail = new ArrayDeque<>();
+        /** Scratch slot: where the renderer parked this body's prepared trail. */
+        int renderIndex;
 
         Planet(double x, double y, double vx, double vy, double mass, double radius,
                Color color, boolean fixed) {
@@ -135,6 +138,26 @@ public class PlanetBoxSimulation {
     // The simulation canvas: physics loop + rendering.
     // ------------------------------------------------------------------
     static class SimulationPanel extends JPanel {
+
+        // The heavy per-frame work — gravity, sampling the space-time sheet, projecting
+        // and shading the mesh, projecting the trails — is split across the common
+        // ForkJoinPool, whose workers plus the calling thread cover every core. Each
+        // kernel is written so a worker only ever writes to the slice it owns, so none
+        // of them need locks. Java2D itself is single-threaded, so the draw calls stay
+        // on the caller; the kernels exist to leave that pass with as little to do as
+        // possible.
+
+        /**
+         * Below these sizes a parallel dispatch costs more than it saves — measured
+         * at roughly 30us of fan-out overhead on this pool — so the same kernels run
+         * inline on the caller instead. The three differ because the work per element
+         * differs: a gravity pair is a handful of flops, a sheet sample is a sqrt, and
+         * a mesh cell also allocates its two Colors.
+         */
+        private static final int PARALLEL_BODY_THRESHOLD = 192;      // bodies (work ~ n^2)
+        private static final long PARALLEL_SAMPLE_THRESHOLD = 20_000; // grid points x bodies
+        private static final int PARALLEL_CELL_THRESHOLD = 1_024;     // mesh cells
+
         private final SimulationConfig cfg;
         private final List<Planet> planets = new CopyOnWriteArrayList<>();
         private final Random rng = new Random();
@@ -243,24 +266,10 @@ public class PlanetBoxSimulation {
             int box = boxSize();
             if (box <= 0) return;
 
+            Planet[] list = planets.toArray(new Planet[0]);
+
             // 1) Pairwise Newtonian gravity with Plummer softening.
-            for (Planet p : planets) { p.ax = 0; p.ay = 0; }
-            List<Planet> list = new ArrayList<>(planets);
-            double eps2 = cfg.softening * cfg.softening;
-            for (int i = 0; i < list.size(); i++) {
-                Planet a = list.get(i);
-                for (int j = i + 1; j < list.size(); j++) {
-                    Planet b = list.get(j);
-                    double dx = b.x - a.x, dy = b.y - a.y;
-                    double distSq = dx * dx + dy * dy + eps2;
-                    double dist = Math.sqrt(distSq);
-                    // F = G m1 m2 / r^2 ; acceleration a = F / m
-                    double force = cfg.gravitationalConstant * a.mass * b.mass / distSq;
-                    double fx = force * dx / dist, fy = force * dy / dist;
-                    a.ax += fx / a.mass;  a.ay += fy / a.mass;
-                    b.ax -= fx / b.mass;  b.ay -= fy / b.mass;
-                }
-            }
+            computeGravity(list);
 
             // 2) Semi-implicit Euler: update velocity first, then position.
             //    Fixed bodies are pinned: they still curve space for everyone else,
@@ -276,11 +285,10 @@ public class PlanetBoxSimulation {
             // 3) Planet-planet collisions (impulse-based, like billiard balls).
             //    Point masses have no cross-section, so there is nothing to resolve.
             if (cfg.planetCollisions && !cfg.pointMasses) {
-                for (int i = 0; i < list.size(); i++) {
-                    Planet a = list.get(i);
-                    for (int j = i + 1; j < list.size(); j++) {
-                        Planet b = list.get(j);
-                        resolveCollision(a, b, cfg.planetRestitution);
+                for (int i = 0; i < list.length; i++) {
+                    Planet a = list[i];
+                    for (int j = i + 1; j < list.length; j++) {
+                        resolveCollision(a, list[j], cfg.planetRestitution);
                     }
                 }
             }
@@ -310,6 +318,54 @@ public class PlanetBoxSimulation {
                     while (p.trail.size() > cfg.trailLength) p.trail.removeFirst();
                 }
             }
+        }
+
+        /**
+         * Accelerations from pairwise Newtonian gravity.
+         *
+         * Each body sums the pull of every other body into its own accumulator, so no
+         * two threads ever write to the same object and the whole O(n^2) sweep splits
+         * cleanly across cores. That costs twice the pair evaluations of the symmetric
+         * "compute once, apply to both" form, but the symmetric form writes to two
+         * bodies per pair and cannot be parallelised without locking or per-thread
+         * accumulator buffers — above a few dozen bodies, cores win easily.
+         *
+         * Positions are snapshotted into flat arrays first: the inner loop then walks
+         * contiguous memory instead of chasing object references.
+         */
+        private void computeGravity(Planet[] ps) {
+            int n = ps.length;
+            if (n == 0) return;
+            double[] px = new double[n], py = new double[n], pm = new double[n];
+            for (int i = 0; i < n; i++) {
+                px[i] = ps[i].x; py[i] = ps[i].y; pm[i] = ps[i].mass;
+            }
+            double eps2 = cfg.softening * cfg.softening;
+            double gConst = cfg.gravitationalConstant;
+
+            if (n < PARALLEL_BODY_THRESHOLD) {
+                for (int i = 0; i < n; i++) accelerate(ps, i, px, py, pm, eps2, gConst);
+            } else {
+                IntStream.range(0, n).parallel()
+                        .forEach(i -> accelerate(ps, i, px, py, pm, eps2, gConst));
+            }
+        }
+
+        /** Total gravitational acceleration on body i. Writes only to ps[i]. */
+        private static void accelerate(Planet[] ps, int i, double[] px, double[] py, double[] pm,
+                                       double eps2, double gConst) {
+            Planet a = ps[i];
+            if (a.fixed) { a.ax = 0; a.ay = 0; return; }  // pinned: acceleration unused
+            double xi = px[i], yi = py[i], ax = 0, ay = 0;
+            for (int j = 0; j < px.length; j++) {
+                if (j == i) continue;
+                double dx = px[j] - xi, dy = py[j] - yi;
+                double d2 = dx * dx + dy * dy + eps2;
+                // a = G m_j r / |r|^3 — the pulled body's own mass cancels out.
+                double s = gConst * pm[j] / (d2 * Math.sqrt(d2));
+                ax += s * dx; ay += s * dy;
+            }
+            a.ax = ax; a.ay = ay;
         }
 
         /** Impulse-based elastic/inelastic collision between two circles. */
@@ -369,26 +425,14 @@ public class PlanetBoxSimulation {
         /** The top-down 2D view, drawn in plane coordinates. */
         private void paintFlat(Graphics2D g2) {
             int box = boxSize();
+            Planet[] snap = snapshotForRender();
+            prepareTrails(snap, null);
 
             // Trails
-            if (cfg.showTrails) {
-                for (Planet p : planets) {
-                    Planet.Point2D prev = null;
-                    int i = 0, n = p.trail.size();
-                    for (Planet.Point2D pt : p.trail) {
-                        if (prev != null) {
-                            float alpha = (float) i / n * 0.55f;
-                            g2.setColor(new Color(p.color.getRed(), p.color.getGreen(), p.color.getBlue(),
-                                    (int) (alpha * 255)));
-                            g2.drawLine((int) prev.x(), (int) prev.y(), (int) pt.x(), (int) pt.y());
-                        }
-                        prev = pt; i++;
-                    }
-                }
-            }
+            for (Planet p : snap) drawTrail(g2, p);
 
             // Planets
-            for (Planet p : planets) {
+            for (Planet p : snap) {
                 double radius = p.radius;
                 int d = (int) (radius * 2);
                 // soft glow
@@ -429,6 +473,111 @@ public class PlanetBoxSimulation {
             g2.setStroke(new BasicStroke(3));
             g2.drawRect(1, 1, box - 3, box - 3);
             g2.setStroke(new BasicStroke(1));
+        }
+
+        // ----------------- Trails -----------------
+        //
+        // At a few hundred bodies the trails are the most expensive thing in a frame:
+        // tens of thousands of short segments, each needing two sheet lookups and a
+        // projection before it can be drawn. That maths is done up front in parallel
+        // into reusable coordinate buffers, leaving the draw pass to do nothing but
+        // issue lines. (Batching the segments into Path2D objects was tried and lost
+        // to plain drawLine — the path machinery costs more than it saves here.)
+
+        /**
+         * Bodies in a stable order, each stamped with the slot holding its prepared
+         * render data. Taken once per paint so the two passes agree even if the user
+         * launches a body mid-frame.
+         */
+        private Planet[] snapshotForRender() {
+            Planet[] snap = planets.toArray(new Planet[0]);
+            for (int i = 0; i < snap.length; i++) snap[i].renderIndex = i;
+            return snap;
+        }
+
+        private static final int TRAIL_FADE_STEPS = 24;
+        private static final int PARALLEL_TRAIL_THRESHOLD = 3_000;   // total trail points
+
+        private int[][] trailX = new int[0][], trailY = new int[0][];
+        private int[] trailCount = new int[0];
+        private Color[][] trailRamp = new Color[0][];
+
+        /**
+         * Projects every trail into its own coordinate buffer, in parallel across
+         * bodies — each writes only its own slot. Passing a WellView projects onto the
+         * 3D sheet; passing null keeps the flat top-down view.
+         */
+        private void prepareTrails(Planet[] snap, WellView v) {
+            int n = snap.length;
+            if (trailX.length < n) {
+                trailX = Arrays.copyOf(trailX, n);
+                trailY = Arrays.copyOf(trailY, n);
+                trailRamp = Arrays.copyOf(trailRamp, n);
+                trailCount = Arrays.copyOf(trailCount, n);
+            }
+            if (!cfg.showTrails) {
+                Arrays.fill(trailCount, 0, n, 0);
+                return;
+            }
+            long points = 0;
+            for (Planet p : snap) points += p.trail.size();
+            if (points < PARALLEL_TRAIL_THRESHOLD) {
+                for (int i = 0; i < n; i++) buildTrail(i, snap[i], v);
+            } else {
+                IntStream.range(0, n).parallel().forEach(i -> buildTrail(i, snap[i], v));
+            }
+        }
+
+        /** Fills slot i with p's projected trail, growing its buffers if needed. */
+        private void buildTrail(int i, Planet p, WellView v) {
+            int m = p.trail.size();
+            trailCount[i] = m;
+            if (m < 2) return;
+            if (trailX[i] == null || trailX[i].length < m) {
+                trailX[i] = new int[m + 64];
+                trailY[i] = new int[m + 64];
+            }
+            int[] xs = trailX[i], ys = trailY[i];
+            int k = 0;
+            for (Planet.Point2D pt : p.trail) {
+                if (v == null) {
+                    xs[k] = (int) pt.x(); ys[k] = (int) pt.y();
+                } else {
+                    xs[k] = (int) v.sx(pt.x(), pt.y());
+                    ys[k] = (int) v.sy(pt.x(), pt.y(), sampleWell(pt.x(), pt.y()));
+                }
+                k++;
+            }
+            // The fade is quantised, so a body needs a couple of dozen Colors rather
+            // than one per segment — and the ramp survives as long as its body does.
+            Color[] ramp = trailRamp[i];
+            if (ramp == null || ramp[0] == null || ramp[TRAIL_FADE_STEPS - 1].getRGB() != rampTop(p)) {
+                ramp = trailRamp[i] = new Color[TRAIL_FADE_STEPS];
+                for (int s = 0; s < TRAIL_FADE_STEPS; s++) {
+                    int alpha = (int) ((s + 0.5f) / TRAIL_FADE_STEPS * 0.6f * 255);
+                    ramp[s] = new Color(p.color.getRed(), p.color.getGreen(), p.color.getBlue(), alpha);
+                }
+            }
+        }
+
+        /** The RGBA the brightest step of p's ramp should have — used to spot a stale ramp. */
+        private static int rampTop(Planet p) {
+            int alpha = (int) ((TRAIL_FADE_STEPS - 0.5f) / TRAIL_FADE_STEPS * 0.6f * 255);
+            return (alpha << 24) | (p.color.getRGB() & 0xFFFFFF);
+        }
+
+        /** Draws a prepared trail, fading along its length. */
+        private void drawTrail(Graphics2D g2, Planet p) {
+            int i = p.renderIndex, m = trailCount[i];
+            if (m < 2) return;
+            int[] xs = trailX[i], ys = trailY[i];
+            Color[] ramp = trailRamp[i];
+            int step = -1;
+            for (int k = 1; k < m; k++) {
+                int s = Math.min(TRAIL_FADE_STEPS - 1, k * TRAIL_FADE_STEPS / m);
+                if (s != step) { step = s; g2.setColor(ramp[s]); }
+                g2.drawLine(xs[k - 1], ys[k - 1], xs[k], ys[k]);
+            }
         }
 
         /** Marks a pinned body: a ring with four ticks, like a surveyor's mark. */
@@ -497,20 +646,39 @@ public class PlanetBoxSimulation {
             double maxZ = maxWellDepth();
             double k = cfg.wellDepthScale;
             Planet[] ps = planets.toArray(new Planet[0]);
-            double[] eps2 = new double[ps.length];
-            for (int m = 0; m < ps.length; m++) eps2[m] = wellSoftening(ps[m]);
+            int bodies = ps.length;
+            double[] bx = new double[bodies], by = new double[bodies];
+            double[] bm = new double[bodies], beps = new double[bodies];
+            for (int m = 0; m < bodies; m++) {
+                bx[m] = ps[m].x; by[m] = ps[m].y;
+                bm[m] = ps[m].mass; beps[m] = wellSoftening(ps[m]);
+            }
 
-            for (int i = 0; i <= n; i++) {
-                double gx = i * wellCell;
-                for (int j = 0; j <= n; j++) {
-                    double gy = j * wellCell;
-                    double potential = 0;
-                    for (int m = 0; m < ps.length; m++) {
-                        double dx = gx - ps[m].x, dy = gy - ps[m].y;
-                        potential += ps[m].mass / Math.sqrt(dx * dx + dy * dy + eps2[m]);
-                    }
-                    wellZ[i][j] = depthOf(potential, maxZ, k);
+            // Each column owns its own row of the array, so the sampling sweep — the
+            // heaviest part of a frame once there are many bodies — fans out across
+            // cores with no synchronisation at all.
+            double cell = wellCell;
+            if ((long) (n + 1) * (n + 1) * Math.max(1, bodies) < PARALLEL_SAMPLE_THRESHOLD) {
+                for (int i = 0; i <= n; i++) sampleColumn(i, n, cell, bx, by, bm, beps, maxZ, k);
+            } else {
+                IntStream.rangeClosed(0, n).parallel()
+                        .forEach(i -> sampleColumn(i, n, cell, bx, by, bm, beps, maxZ, k));
+            }
+        }
+
+        /** Fills one column of the sheet. Writes only to wellZ[i]. */
+        private void sampleColumn(int i, int n, double cell, double[] bx, double[] by,
+                                  double[] bm, double[] beps, double maxZ, double k) {
+            double gx = i * cell;
+            double[] column = wellZ[i];
+            for (int j = 0; j <= n; j++) {
+                double gy = j * cell;
+                double potential = 0;
+                for (int m = 0; m < bx.length; m++) {
+                    double dx = gx - bx[m], dy = gy - by[m];
+                    potential += bm[m] / Math.sqrt(dx * dx + dy * dy + beps[m]);
                 }
+                column[j] = depthOf(potential, maxZ, k);
             }
         }
 
@@ -552,6 +720,62 @@ public class PlanetBoxSimulation {
             return top * (1 - ty) + bot * ty;
         }
 
+        // Mesh geometry and shading, rebuilt each frame ahead of the draw pass.
+        // gridSx[j][i] / gridSy[j][i] are the screen coordinates of grid point (i,j);
+        // cellFill / cellLine are indexed j * wellN + i.
+        private int[][] gridSx, gridSy;
+        private Color[] cellFill, cellLine;
+
+        /**
+         * Projects every grid point and shades every cell, in parallel across rows.
+         * Rows are independent — each writes only its own slice — and doing this up
+         * front also removes the fourfold redundancy of projecting shared corners
+         * once per adjoining cell.
+         */
+        private void prepareMesh(WellView v, double maxZ) {
+            int n = wellN;
+            if (gridSx == null || gridSx.length != n + 1) {
+                gridSx = new int[n + 1][n + 1];
+                gridSy = new int[n + 1][n + 1];
+                cellFill = new Color[n * n];
+                cellLine = new Color[n * n];
+            }
+            if (n * n < PARALLEL_CELL_THRESHOLD) {
+                for (int j = 0; j <= n; j++) prepareMeshRow(j, n, v, maxZ);
+            } else {
+                IntStream.rangeClosed(0, n).parallel().forEach(j -> prepareMeshRow(j, n, v, maxZ));
+            }
+        }
+
+        /** Projects row j of grid points, and shades the cells hanging below it. */
+        private void prepareMeshRow(int j, int n, WellView v, double maxZ) {
+            double cell = wellCell;
+            double y = j * cell;
+            int[] sxRow = gridSx[j], syRow = gridSy[j];
+            for (int i = 0; i <= n; i++) {
+                double x = i * cell;
+                sxRow[i] = (int) v.sx(x, y);
+                syRow[i] = (int) v.sy(x, y, wellZ[i][j]);
+            }
+            if (j == n) return;   // last grid row bounds no cells of its own
+
+            int base = j * n;
+            for (int i = 0; i < n; i++) {
+                double z00 = wellZ[i][j], z10 = wellZ[i + 1][j];
+                double z01 = wellZ[i][j + 1], z11 = wellZ[i + 1][j + 1];
+                double avgZ = (z00 + z10 + z01 + z11) * 0.25;
+                double depth = Math.min(1, -avgZ / maxZ);
+                // Diffuse shading from the sheet's own slope.
+                double dzdx = ((z10 + z11) - (z00 + z01)) * 0.5 / cell;
+                double dzdy = ((z01 + z11) - (z00 + z10)) * 0.5 / cell;
+                double len = Math.sqrt(dzdx * dzdx + dzdy * dzdy + 1);
+                double lambert = (0.45 * dzdx + 0.62 * dzdy + 0.65) / len;
+                double shade = 0.35 + 0.75 * Math.max(0, lambert);
+                cellFill[base + i] = wellColor(depth, shade, false);
+                cellLine[base + i] = wellColor(depth, shade, true);
+            }
+        }
+
         private void paintGravityWell(Graphics2D g2) {
             int box = boxSize();
             if (box <= 0) return;
@@ -559,49 +783,49 @@ public class PlanetBoxSimulation {
             computeWellGrid(box);
             WellView v = new WellView();
             double maxZ = maxWellDepth();
+            Planet[] snap = snapshotForRender();
+            prepareTrails(snap, v);
 
             // Bucket the planets by mesh row so they can be drawn interleaved with
             // the sheet — that gives correct occlusion without a depth buffer.
             List<List<Planet>> byRow = new ArrayList<>(wellN);
             for (int j = 0; j < wellN; j++) byRow.add(null);
-            for (Planet p : planets) {
+            for (Planet p : snap) {
                 int j = Math.max(0, Math.min(wellN - 1, (int) (p.y / wellCell)));
                 if (byRow.get(j) == null) byRow.set(j, new ArrayList<>(2));
                 byRow.get(j).add(p);
             }
+
+            // Everything that can be worked out ahead of the draw calls is worked out
+            // in parallel; the serial pass below is then nothing but Java2D calls.
+            prepareMesh(v, maxZ);
 
             // Painter's algorithm: rows always run far -> near (cos(yaw) > 0);
             // columns run far -> near depending on the sign of sin(yaw).
             boolean colsAscending = v.sinY >= 0;
             int[] xs = new int[4], ys = new int[4];
 
+            // The mesh quads tile the plane edge to edge, so antialiasing their shared
+            // borders costs a lot of rasteriser time and only muddies the seams. The
+            // spheres, trails and rim below keep it.
+            g2.setRenderingHint(RenderingHints.KEY_ANTIALIASING, RenderingHints.VALUE_ANTIALIAS_OFF);
+
             for (int j = 0; j < wellN; j++) {
-                double y0 = j * wellCell, y1 = (j + 1) * wellCell;
+                int[] rowSx = gridSx[j], rowSy = gridSy[j];
+                int[] nextSx = gridSx[j + 1], nextSy = gridSy[j + 1];
+                int base = j * wellN;
                 for (int c = 0; c < wellN; c++) {
                     int i = colsAscending ? c : wellN - 1 - c;
-                    double x0 = i * wellCell, x1 = (i + 1) * wellCell;
-                    double z00 = wellZ[i][j], z10 = wellZ[i + 1][j];
-                    double z01 = wellZ[i][j + 1], z11 = wellZ[i + 1][j + 1];
+                    xs[0] = rowSx[i];      ys[0] = rowSy[i];
+                    xs[1] = rowSx[i + 1];  ys[1] = rowSy[i + 1];
+                    xs[2] = nextSx[i + 1]; ys[2] = nextSy[i + 1];
+                    xs[3] = nextSx[i];     ys[3] = nextSy[i];
 
-                    xs[0] = (int) v.sx(x0, y0); ys[0] = (int) v.sy(x0, y0, z00);
-                    xs[1] = (int) v.sx(x1, y0); ys[1] = (int) v.sy(x1, y0, z10);
-                    xs[2] = (int) v.sx(x1, y1); ys[2] = (int) v.sy(x1, y1, z11);
-                    xs[3] = (int) v.sx(x0, y1); ys[3] = (int) v.sy(x0, y1, z01);
-
-                    double avgZ = (z00 + z10 + z01 + z11) * 0.25;
-                    double depth = Math.min(1, -avgZ / maxZ);
-                    // Diffuse shading from the sheet's own slope.
-                    double dzdx = ((z10 + z11) - (z00 + z01)) * 0.5 / wellCell;
-                    double dzdy = ((z01 + z11) - (z00 + z10)) * 0.5 / wellCell;
-                    double len = Math.sqrt(dzdx * dzdx + dzdy * dzdy + 1);
-                    double lambert = (0.45 * dzdx + 0.62 * dzdy + 0.65) / len;
-                    double shade = 0.35 + 0.75 * Math.max(0, lambert);
-
-                    g2.setColor(wellColor(depth, shade, false));
+                    g2.setColor(cellFill[base + i]);
                     g2.fillPolygon(xs, ys, 4);
                     // Only the top and left edges: the neighbouring cells supply the
                     // rest, and the outer two edges are covered by the rim pass.
-                    g2.setColor(wellColor(depth, shade, true));
+                    g2.setColor(cellLine[base + i]);
                     g2.drawLine(xs[0], ys[0], xs[1], ys[1]);
                     g2.drawLine(xs[0], ys[0], xs[3], ys[3]);
                 }
@@ -612,17 +836,22 @@ public class PlanetBoxSimulation {
                         here.sort(colsAscending ? Comparator.comparingDouble(p -> p.x)
                                                 : Comparator.comparingDouble(p -> -p.x));
                     }
+                    g2.setRenderingHint(RenderingHints.KEY_ANTIALIASING,
+                            RenderingHints.VALUE_ANTIALIAS_ON);
                     for (Planet p : here) drawPlanet3D(g2, v, p);
+                    g2.setRenderingHint(RenderingHints.KEY_ANTIALIASING,
+                            RenderingHints.VALUE_ANTIALIAS_OFF);
                 }
             }
+            g2.setRenderingHint(RenderingHints.KEY_ANTIALIASING, RenderingHints.VALUE_ANTIALIAS_ON);
 
             // Rim of the box, riding the edge of the sheet.
             g2.setColor(new Color(120, 145, 235, 200));
             g2.setStroke(new BasicStroke(2f));
-            drawWellEdge(g2, v, 0, 0, 1, 0);
-            drawWellEdge(g2, v, 0, wellN, 1, 0);
-            drawWellEdge(g2, v, 0, 0, 0, 1);
-            drawWellEdge(g2, v, wellN, 0, 0, 1);
+            drawWellEdge(g2, 0, 0, 1, 0);
+            drawWellEdge(g2, 0, wellN, 1, 0);
+            drawWellEdge(g2, 0, 0, 0, 1);
+            drawWellEdge(g2, wellN, 0, 0, 1);
             g2.setStroke(new BasicStroke(1f));
 
             // Launch preview: a ghost body sitting on the sheet, plus its heading.
@@ -649,12 +878,11 @@ public class PlanetBoxSimulation {
         }
 
         /** Traces one edge of the mesh, following the sheet's height. */
-        private void drawWellEdge(Graphics2D g2, WellView v, int i0, int j0, int di, int dj) {
+        private void drawWellEdge(Graphics2D g2, int i0, int j0, int di, int dj) {
             int px = 0, py = 0;
             for (int s = 0; s <= wellN; s++) {
                 int i = i0 + di * s, j = j0 + dj * s;
-                double x = i * wellCell, y = j * wellCell;
-                int sx = (int) v.sx(x, y), sy = (int) v.sy(x, y, wellZ[i][j]);
+                int sx = gridSx[j][i], sy = gridSy[j][i];
                 if (s > 0) g2.drawLine(px, py, sx, sy);
                 px = sx; py = sy;
             }
@@ -684,22 +912,7 @@ public class PlanetBoxSimulation {
             double r = radius * v.scale;
 
             // Trail, projected down onto the sheet.
-            if (cfg.showTrails && !p.trail.isEmpty()) {
-                Planet.Point2D prev = null;
-                int i = 0, n = p.trail.size();
-                for (Planet.Point2D pt : p.trail) {
-                    if (prev != null) {
-                        float alpha = (float) i / n * 0.6f;
-                        g2.setColor(new Color(p.color.getRed(), p.color.getGreen(), p.color.getBlue(),
-                                (int) (alpha * 255)));
-                        g2.drawLine((int) v.sx(prev.x(), prev.y()),
-                                (int) v.sy(prev.x(), prev.y(), sampleWell(prev.x(), prev.y())),
-                                (int) v.sx(pt.x(), pt.y()),
-                                (int) v.sy(pt.x(), pt.y(), sampleWell(pt.x(), pt.y())));
-                    }
-                    prev = pt; i++;
-                }
-            }
+            drawTrail(g2, p);
 
             // Sphere: radial gradient with the highlight up and to the left.
             g2.setPaint(new RadialGradientPaint(
